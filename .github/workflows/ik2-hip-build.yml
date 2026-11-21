@@ -37,6 +37,7 @@ jobs:
         run: |
           for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)"') do set "PYEXE=%%P"
           for %%D in ("%PYEXE%") do set "ROCM_VENV=%%~dpD"
+          echo ROCM_VENV=%ROCM_VENV%>>%GITHUB_ENV%
           echo ROCM_VENV=%ROCM_VENV%
           dir "%ROCM_VENV%\Scripts\rocm-sdk.exe" || (echo rocm-sdk.exe not found & exit /b 1)
           call tools\hip\build_maya_windows.bat || exit /b 1
@@ -44,7 +45,7 @@ jobs:
       - name: Collect the runtime DLLs
         shell: pwsh
         run: |
-          $root = (& "$env:ROCM_VENV\Scripts\rocm-sdk.exe" path --root)
+          $root = Join-Path $env:ROCM_VENV "Lib/site-packages/_rocm_sdk_devel"
           Write-Host "ROCm root: $root"
           New-Item -ItemType Directory -Force -Path runtime | Out-Null
           Copy-Item build-hip-win\maya-ik2.exe runtime\ -ErrorAction SilentlyContinue
