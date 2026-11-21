@@ -11,6 +11,16 @@
 #include <cstdlib>
 #include <cstring>
 
+// RDNA3's matrix cores, for the WMMA rewrites of the mma.sync kernels below (the guard the CUDA build never
+// defines: it compiles exactly what it did without this).  gfx1101 is WMMA-capable, and cmake's hip backend
+// defines STRATA_HAS_WMMA for it; rdna_wmma.hpp is the shared layer maya-ds4's engine takes its WMMA from.
+#if defined(STRATA_USE_HIP) && defined(STRATA_HAS_WMMA)
+#include "strata/kernels/rdna_wmma.hpp"
+using maya::kernels::wmma_f16;
+using maya::kernels::wmma_h16;
+using maya::kernels::wmma_f8;
+#endif
+
 namespace ik2::k {
 namespace {
 
@@ -958,6 +968,25 @@ __device__ __forceinline__ void cp_async_wait() {
 #endif
 }
 
+#if defined(STRATA_USE_HIP) && defined(STRATA_HAS_WMMA) && defined(__GFX11__)
+// RDNA3's matrix cores (rdna_wmma.hpp): a 16 x 16 x 16 product of F16 operands with F32 sums, where a lane's A
+// operand is the whole row lane % 16 of a k-step, its B the whole column lane % 16 (both halves of the wave the
+// same), and its 8 sums the row 2 i + hi - i = 0 .. 7, hi = lane / 16 - of column lane % 16: the mma.sync
+// fragments of the kernels below, re-laid out for it.  (gfx12 spreads a lane's sums over a whole 8-row half of the
+// accumulator instead: the rewrites are laid out for gfx11's interleaved one, and a gfx12 build falls back to the
+// trap guards' scalar dispatch rather than compute a kernel of them wrong.)
+union WmmaBits {   // (an operand's 16 halves as the 8 registers the packing helpers build them in)
+    wmma_h16 f;
+    uint32_t u[8];
+};
+__device__ __forceinline__ wmma_f8 wmma_zero8() {
+    wmma_f8 z;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) z[i] = 0.0f;
+    return z;
+}
+#endif
+
 // one 64-key tile of K and V (rows kt .. kt+63; rows at or past k_end zero-filled) into smem, NT threads
 template <int NT>
 __device__ __forceinline__ void fa_load_tile(uint16_t* Ks, uint16_t* Vs, const uint16_t* kc, const uint16_t* vc,
@@ -1410,6 +1439,178 @@ __device__ __forceinline__ int wa_active(int qpos, int window, int nw, int& k_lo
     return min(nw, (n_steps + kWaMin - 1) / kWaMin);
 }
 
+#if defined(STRATA_USE_HIP) && defined(STRATA_HAS_WMMA) && defined(__GFX11__)
+// ---- one token's attention on RDNA3's matrix cores (the Ampere one: #else below).  The warp walks its run of the
+// keys the same way, 16 a step and straight from the cache, but a lane is one head's throughout: its B of Q K^T
+// and its P of P V the head c = lane % 16's (the heads past R read zeros, and the matrix cores' 16 columns run
+// half idle - R <= 8), its 8 logits the step's keys 2 i + hi, its 8 of the output's 128 dims the 16 j + 2 i + hi.
+// A head's logits lie in two lanes then, one parity of the keys each: the lane keeps the online softmax of its own
+// half, and the halves' (max, sum) merge over the lane l ^ 16 at the end - the output dims of the two never
+// overlap, so each lane scales its own by its exp2 and stores them.  Q is read back a step at a time (every warp
+// of the block reads the same heads': L1 holds it - the 64 sums a lane are what stay in the registers), and V
+// reaches the lanes transposed, a dim a lane against the cache's rows: the fragment layouts leave no way around
+// it short of a shared-memory staging, which would take the no-shared-memory occupancy the kernel runs on (a
+// warp's wait is another warp's arithmetic).  An FP8 cache's bytes are turned FP16 per value on the way in.
+template <class KVT>
+__global__ void __launch_bounds__(kWaNW * 32)   // (no min-blocks: 64 sums and a step's fragments a lane)
+attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
+                       int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
+                       const float* __restrict__ r, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
+                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+    constexpr bool F8 = sizeof(KVT) == 1;
+    if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
+    const int lane = threadIdx.x & 31, c = lane & 15, hi = lane >> 4;
+    const int g = blockIdx.x, R = H / Hkv, KD = Hkv * kFaD;
+    const int w = blockIdx.y * kWaNW + (threadIdx.x >> 5);   // this warp of the K / V head's
+    int k_lo, n_steps;
+    const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
+    if (w >= n_act) return;
+    const int per = (n_steps + n_act - 1) / n_act;
+    const int st0 = min(n_steps, w * per), st1 = min(n_steps, st0 + per);
+    const bool h_ok = c < R;   // the lane's head: its B of Q K^T, its sums' column, its r of the bias
+    const uint16_t* qh = q16 + (size_t) (g * R + (h_ok ? c : 0)) * kFaD;
+    const float* rc = r + (size_t) (g * R + (h_ok ? c : 0)) * d_rel;
+    wmma_f8 o[kFaD / 16];   // o[j][i]: the head's dim 16 j + 2 i + hi
+#pragma unroll
+    for (int j = 0; j < kFaD / 16; ++j) o[j] = wmma_zero8();
+    float ma = -INFINITY, la = 0.0f;
+    const float sc = qk_scale * kLog2e;
+    for (int st = st0; st < st1; ++st) {
+        const int kt = k_lo + st * 16, kmax = qpos - kt;
+        const int row0 = kv_cap > 0 ? kt % kv_cap : kt;
+        // a key's row in the cache (a key past the token's: the token's, its logits masked below)
+        auto row = [&](int key) {
+            int rw = row0 + min(key, kmax);
+            if (kv_cap > 0 && rw >= kv_cap) rw -= kv_cap;
+            return (size_t) rw * KD;
+        };
+        // Q K^T: A the lane's key (row c of the wave, both halves of it the same) against B the heads' q - 8
+        // k-steps of 16 dims, the even and the odd ones in two accumulators so the sums do not wait on one another
+        const KVT* kr = kc + row(c) + (size_t) g * kFaD;
+        wmma_f8 sa = wmma_zero8(), sb = wmma_zero8();
+#pragma unroll
+        for (int kk = 0; kk < kFaD / 16; ++kk) {
+            WmmaBits a;
+            if constexpr (F8) {   // (16 bytes: the dims 16 kk .. + 15 as FP16)
+                const uint4 k8 = __ldg((const uint4*) (kr + 16 * kk));
+                const uint4 h0 = e4m3x8_h8(make_uint2(k8.x, k8.y)), h1 = e4m3x8_h8(make_uint2(k8.z, k8.w));
+                a.u[0] = h0.x, a.u[1] = h0.y, a.u[2] = h0.z, a.u[3] = h0.w;
+                a.u[4] = h1.x, a.u[5] = h1.y, a.u[6] = h1.z, a.u[7] = h1.w;
+            } else {
+                const uint4 k0 = __ldg((const uint4*) (kr + 16 * kk)), k1 = __ldg((const uint4*) (kr + 16 * kk) + 1);
+                a.u[0] = k0.x, a.u[1] = k0.y, a.u[2] = k0.z, a.u[3] = k0.w;
+                a.u[4] = k1.x, a.u[5] = k1.y, a.u[6] = k1.z, a.u[7] = k1.w;
+            }
+            WmmaBits b;
+            if (h_ok) {
+                const uint4 q0 = __ldg((const uint4*) (qh + 16 * kk)), q1 = __ldg((const uint4*) (qh + 16 * kk) + 1);
+                b.u[0] = q0.x, b.u[1] = q0.y, b.u[2] = q0.z, b.u[3] = q0.w;
+                b.u[4] = q1.x, b.u[5] = q1.y, b.u[6] = q1.z, b.u[7] = q1.w;
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) b.u[e] = 0u;
+            }
+            if (kk & 1) sb = wmma_f16(a.f, b.f, sb);
+            else sa = wmma_f16(a.f, b.f, sa);
+        }
+        // the lane's logits (log2 units): value i the key kt + 2 i + hi of head c
+        float lg[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) lg[i] = (sa[i] + sb[i]) * sc;
+        if (h_ok && qpos - (kt + 15) < extent) {   // (a step within the bias's extent of the token)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = qpos - (kt + 2 * i + hi);
+                if (d >= 0 && d < extent) {   // (zero where out of the extent)
+                    const float* pj = proj + (size_t) d * d_rel;
+                    float bi = 0.0f;
+                    if (rel4) {
+                        for (int e = 0; e < d_rel; e += 4) {
+                            const float4 x = __ldg((const float4*) (pj + e)), y = __ldg((const float4*) (rc + e));
+                            bi += x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
+                        }
+                    } else {
+                        for (int e = 0; e < d_rel; ++e) bi += pj[e] * rc[e];
+                    }
+                    lg[i] += bi * kLog2e;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) lg[i] = (kt + 2 * i + hi > qpos || !h_ok) ? -INFINITY : lg[i];
+        // the online softmax of the lane's half of the head's keys, in the log2 domain
+        float mx = lg[0];
+#pragma unroll
+        for (int i = 1; i < 8; ++i) mx = fmaxf(mx, lg[i]);
+        if (__ballot_sync(0xffffffffu, mx > ma)) {   // a new maximum (few steps have one): rescale
+            const float mn = fmaxf(ma, mx);
+            const float ca = mn == -INFINITY ? 1.0f : exp2f(ma - mn);   // (ma = -inf: exp2f(-inf) = 0)
+            ma = mn;
+            la *= ca;
+#pragma unroll
+            for (int j = 0; j < kFaD / 16; ++j) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) o[j][i] *= ca;
+            }
+        }
+        const float ua = ma == -INFINITY ? 0.0f : ma;
+        float p[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            p[i] = exp2f(lg[i] - ua);   // (a masked key's, or a past-R head's, exactly 0)
+            la += p[i];
+        }
+        // P (FP16) for the head's column: the keys 4 q, 4 q + 1 of a register - the lane's own logits and the
+        // lane l ^ 16's interleaved
+        uint32_t po[4], oth[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) po[q] = f2_to_u32(p[2 * q], p[2 * q + 1]);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) oth[q] = __shfl_xor_sync(0xffffffffu, po[q], 16);
+        WmmaBits pb;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint32_t ev = hi ? oth[q] : po[q], od = hi ? po[q] : oth[q];   // (the keys 4 q + 1's halves)
+            pb.u[2 * q] = __byte_perm(ev, od, 0x5410);
+            pb.u[2 * q + 1] = __byte_perm(ev, od, 0x7632);
+        }
+        // P V: A the tile transposed - the lane's dim 16 j + c of the 16 keys, against the cache's rows - B the
+        // head's P column
+#pragma unroll
+        for (int j = 0; j < kFaD / 16; ++j) {
+            WmmaBits a;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const KVT* v0 = vc + row(2 * t) + (size_t) g * kFaD + 16 * j + c;
+                const KVT* v1 = vc + row(2 * t + 1) + (size_t) g * kFaD + 16 * j + c;
+                if constexpr (F8) {
+                    const uint16_t h0 = e4m3fn_to_f16(__ldg(v0)), h1 = e4m3fn_to_f16(__ldg(v1));
+                    a.u[t] = (uint32_t) h0 | ((uint32_t) h1 << 16);
+                } else {
+                    a.u[t] = (uint32_t) *v0 | ((uint32_t) *v1 << 16);
+                }
+            }
+            o[j] = wmma_f16(a.f, pb.f, o[j]);
+        }
+    }
+    // the head's other half of the keys (the lane l ^ 16's max and sum) merged in: the dims of the two lanes never
+    // overlap, so each scales its own by its exp2 and stores them
+    const float mo = __shfl_xor_sync(0xffffffffu, ma, 16), ls = __shfl_xor_sync(0xffffffffu, la, 16);
+    const float m = fmaxf(ma, mo);
+    const float ca = m == -INFINITY ? 1.0f : exp2f(ma - m), cb = m == -INFINITY ? 1.0f : exp2f(mo - m);
+    la = la * ca + ls * cb;
+    // the warp's partials: o_part [warp][H][D], ml_part [warp][H] = (max in log2 units, sum)
+    if (h_ok) {
+        float* op = o_part + ((size_t) w * H + g * R + c) * kFaD;
+#pragma unroll
+        for (int j = 0; j < kFaD / 16; ++j) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) op[16 * j + 2 * i + hi] = o[j][i] * ca;
+        }
+        if (hi == 0) ml_part[(size_t) w * H + g * R + c] = make_float2(m, la);
+    }
+}
+#else
 template <class KVT>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
@@ -1598,6 +1799,7 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
         if (gr == 0) ml_part[(size_t) w * H + g * R + qb] = make_float2(mb, lb);
     }
 }
+#endif
 // the warps merged with the sink: out [H][D] (times v_inv: an FP8 cache's V scale; times the sigmoid of gate [H][D]
 // if given; out16: an FP16 copy); a block a head, D threads.  A warp's weight (the exp2 of its max less the overall
 // one) is found once and kept in shared memory.
@@ -2565,12 +2767,26 @@ __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4
     h = (x == 0x7Fu) ? 0u : h;
     return h | (h << 16);
 }
+#ifdef STRATA_USE_HIP
+// (HIP has no PTX: the packed FP16 multiply / subtract as __hmul2 / __hsub2 - the same round-to-nearest
+// instructions the PTX ones stand for; a CUDA build never sees these)
+__device__ __forceinline__ __half2 bits_h2(uint32_t u) {
+    return __halves2half2(__ushort_as_half((uint16_t) u), __ushort_as_half((uint16_t) (u >> 16)));
+}
+__device__ __forceinline__ uint32_t h2_bits(__half2 h) {
+    return (uint32_t) __half_as_ushort(__low2half(h)) | ((uint32_t) __half_as_ushort(__high2half(h)) << 16);
+}
+#endif
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
     const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
+#ifdef STRATA_USE_HIP
+    return h2_bits(__hmul2(bits_h2(mag | sign), bits_h2(scale)));
+#else
     uint32_t r;
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
     return r;
+#endif
 }
 struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
     uint32_t sa, sb, wa0, wa1, wb0, wb1;
@@ -2586,6 +2802,111 @@ __device__ __forceinline__ NvStep nv_step_load(const uint8_t* a, const uint8_t* 
 }
 // A block is a group of 16 rows, its SPLIT warps each a stride of the K blocks (more rows of weights in flight than
 // a warp alone keeps: a warp waits for a block's bytes before it asks for more than the next one's).
+#if defined(STRATA_USE_HIP) && defined(STRATA_HAS_WMMA) && defined(__GFX11__)
+// ---- one token's NVFP4 experts on RDNA3's matrix cores (the Ampere one: #else below).  A warp is the same 16
+// rows - gate / up: 8 gate rows in the rows 0 .. 7 and the same 8 of up in 8 .. 15, so that SwiGLU is a lane's;
+// down: 16 - over its stride of the 64-value blocks, and a lane's A is the whole row lane % 16: its 16 codes of a
+// 16-value step m, the scale of byte m and the codes of bytes 8 m .. + 7 (the low nibbles the values 16 m + 2 p
+// and + 1 in the registers p, the high the values + 8 in 4 + p).  B is the input in FP16 where it lies, in all 16
+// columns - gate: the even columns the hi limb and the odd the lo (the columns of a lane pair l, l ^ 1 hold each
+// row's product with the FP32 input, hi + lo), down: h in every column, a lane's single product a row's - so the
+// lanes c = 0 write the sums out for the splits to add.  A code times its sub-block's scale is exact in FP16; the
+// sum is the matrix cores' FP32.
+struct NvStepW {   // a lane's 64-value block of its one row: the four sub-block scales and the codes
+    uint32_t sc, w[8];
+};
+__device__ __forceinline__ NvStepW nv_step_w(const uint8_t* rw, int k) {
+    const uint32_t* p = (const uint32_t*) (rw + (size_t) k * 36);
+    NvStepW r;
+    r.sc = __ldg(p);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) r.w[i] = __ldg(p + 1 + i);
+    return r;
+}
+// the 16 values of sub-block m of the lane's row, each times the sub-block's scale, as A
+__device__ __forceinline__ wmma_h16 nv_a(const NvStepW& s, int m) {
+    const uint32_t sc = ue4m3_h2((s.sc >> (8 * m)) & 0xFFu);
+    WmmaBits a;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const uint32_t hw = s.w[2 * m + (p >> 1)] >> (16 * (p & 1));
+        a.u[p] = nv_pair_h2(hw, sc), a.u[4 + p] = nv_pair_h2(hw >> 4, sc);
+    }
+    return a.f;
+}
+// the 16 values 16 m .. + 15 of the input (or, for gate, its limb) as B
+__device__ __forceinline__ wmma_h16 nv_b(const uint16_t* x, int k, int m) {
+    const uint4 x0 = __ldg((const uint4*) (x + 64 * k + 16 * m));
+    const uint4 x1 = __ldg((const uint4*) (x + 64 * k + 16 * m) + 1);
+    WmmaBits b;
+    b.u[0] = x0.x, b.u[1] = x0.y, b.u[2] = x0.z, b.u[3] = x0.w;
+    b.u[4] = x1.x, b.u[5] = x1.y, b.u[6] = x1.z, b.u[7] = x1.w;
+    return b.f;
+}
+template <bool Gate, int SPLIT>
+__global__ void __launch_bounds__(SPLIT * 32)
+experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F, const uint16_t* __restrict__ x16,
+                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap) {
+    __shared__ float part[SPLIT][16];   // (gate: a row's gate and up; down: the 16 rows)
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, c = lane & 15, hi = lane >> 4, slot = blockIdx.y;
+    const int K = Gate ? C : F;
+    const int base = blockIdx.x * (Gate ? 8 : 16);
+    const size_t rb = (size_t) (K / 64) * 36;
+    // the lane's A row: gate 0 .. 7 the gate row base + c, 8 .. 15 the same up row; down the row base + c
+    const uint8_t* ar = Gate ? blob[slot] + (c < 8 ? 0 : off) + (size_t) (base + (c & 7)) * rb
+                             : blob[slot] + off + (size_t) (base + c) * rb;
+    // (gate / up: the input as two FP16 limbs, x = hi + lo, [2][C] - the even columns the hi, the odd the lo; down:
+    //  h is FP16 itself, every column the same)
+    const uint16_t* xb = x16 + (Gate ? (c & 1 ? (size_t) C : 0) : (size_t) slot * x_ld);
+    const int nk = K / 64;
+    wmma_f8 v = wmma_zero8();
+    NvStepW cur = nv_step_w(ar, split);
+    for (int k = split; k < nk; k += SPLIT) {
+        NvStepW nxt = cur;
+        if (k + SPLIT < nk) nxt = nv_step_w(ar, k + SPLIT);
+#pragma unroll
+        for (int m = 0; m < 4; ++m) v = wmma_f16(nv_a(cur, m), nv_b(xb, k, m), v);
+        cur = nxt;
+    }
+    if (Gate) {   // (the lanes l and l ^ 1's columns are a row's two limbs: their pair the product with the FP32
+        //  input - every lane's v the full product then, and only the lanes c = 0 need write it out)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] += __shfl_xor_sync(0xffffffffu, v[i], 1);
+    }
+    // the sums: value i the row 2 i + hi's (gate rows in the values 0 .. 3, up rows in 4 .. 7)
+    if (c == 0) {
+#pragma unroll
+        for (int i = 0; i < (Gate ? 4 : 8); ++i) {
+            const int row = 2 * i + hi;
+            if (Gate) {
+                part[split][2 * row] = v[i];
+                part[split][2 * row + 1] = v[4 + i];
+            } else {
+                part[split][row] = v[i];
+            }
+        }
+    }
+    __syncthreads();
+    if (split || c) return;
+#pragma unroll
+    for (int i = 0; i < (Gate ? 4 : 8); ++i) {
+        const int row = 2 * i + hi;
+        if (Gate) {
+            float gg = part[0][2 * row], u = part[0][2 * row + 1];
+#pragma unroll
+            for (int sp = 1; sp < SPLIT; ++sp) gg += part[sp][2 * row], u += part[sp][2 * row + 1];
+            gg *= sg ? sg[slot] : 1.0f, u *= su ? su[slot] : 1.0f;
+            hidden[(size_t) slot * F + base + row] =
+                f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+        } else {
+            float tot = part[0][row];
+#pragma unroll
+            for (int sp = 1; sp < SPLIT; ++sp) tot += part[sp][row];
+            y[(size_t) slot * C + base + row] = tot;
+        }
+    }
+}
+#else
 template <bool Gate, int SPLIT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F, const uint16_t* __restrict__ x16,
@@ -2634,6 +2955,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
         y[(size_t) slot * C + r + 8] = tot.y;
     }
 }
+#endif
 
 template <int WARPS, int ROWS>
 __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up, size_t eb0,
@@ -4154,14 +4476,22 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // the int8 pairs of Q8_0 blocks as FP16 (exact), and those times a block scale
 __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
     const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
+#ifdef STRATA_USE_HIP
+    return h2_bits(__hsub2(bits_h2(u), bits_h2(0x64806480u)));
+#else
     uint32_t f;
     asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
     return f;
+#endif
 }
 __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
     uint32_t f = q8_pair(w);
+#ifdef STRATA_USE_HIP
+    return h2_bits(__hmul2(bits_h2(f), bits_h2(scale)));
+#else
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
     return f;
+#endif
 }
 
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
