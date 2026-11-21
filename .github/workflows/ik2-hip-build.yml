@@ -1,0 +1,56 @@
+name: "ik2 HIP Windows build"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "maya-ik2 for gfx1101 (TheRock wheels + their bat)"
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - name: Checkout (ik2-hip branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ik2-hip
+          submodules: recursive
+
+      - name: Python + toolchain wheels
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install ninja cmake rocm-sdk
+          $v = pip show rocm-sdk | Select-String 'Location'
+          Write-Host "rocm-sdk at: $v"
+
+      - name: Build via their Windows HIP script
+        shell: cmd
+        env:
+          MAYA_HIP_ARCHS: gfx1101
+        run: |
+          for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)"') do set "PYEXE=%%P"
+          for %%D in ("%PYEXE%") do set "ROCM_VENV=%%~dpD"
+          echo ROCM_VENV=%ROCM_VENV%
+          dir "%ROCM_VENV%\Scripts\rocm-sdk.exe" || (echo rocm-sdk.exe not found & exit /b 1)
+          call tools\hip\build_maya_windows.bat || exit /b 1
+
+      - name: Collect the runtime DLLs
+        shell: pwsh
+        run: |
+          $root = (& "$env:ROCM_VENV\Scripts\rocm-sdk.exe" path --root)
+          Write-Host "ROCm root: $root"
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          Copy-Item build-hip-win\maya-ik2.exe runtime\ -ErrorAction SilentlyContinue
+          if (!(Test-Path runtime\maya-ik2.exe)) { Get-ChildItem build-hip-win -Recurse -Filter maya-ik2.exe | ForEach-Object { Copy-Item $_.FullName runtime\ } }
+          Copy-Item "$root\bin\*.dll" runtime\ -ErrorAction SilentlyContinue
+          Copy-Item "$root\lib\llvm\bin\*.dll" runtime\ -ErrorAction SilentlyContinue
+          if (Test-Path "$root\lib\rocblas\library") { Copy-Item "$root\lib\rocblas\library" runtime\rocblas-library -Recurse -ErrorAction SilentlyContinue }
+          Get-ChildItem runtime | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload binary + runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: maya-ik2-gfx1101-win
+          path: |
+            runtime/
+          if-no-files-found: error
