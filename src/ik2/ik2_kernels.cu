@@ -3,7 +3,9 @@
 #include "ik2_iq_tables.h"
 
 #include <cuda_fp16.h>
+#if !defined(STRATA_USE_HIP)
 #include <cuda_fp8.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -14,7 +16,9 @@
 // RDNA3's matrix cores, for the WMMA rewrites of the mma.sync kernels below (the guard the CUDA build never
 // defines: it compiles exactly what it did without this).  gfx1101 is WMMA-capable, and cmake's hip backend
 // defines STRATA_HAS_WMMA for it; rdna_wmma.hpp is the shared layer maya-ds4's engine takes its WMMA from.
-#if defined(STRATA_USE_HIP) && defined(STRATA_HAS_WMMA)
+// (the header's own content guard needs __GFX11__, a device-pass-only macro: the usings must match it or the
+//  host pass sees an empty namespace - the device pass compiles the WMMA bodies either way)
+#if defined(__HIPCC__) && defined(STRATA_USE_HIP) && defined(__GFX11__)
 #include "strata/kernels/rdna_wmma.hpp"
 using maya::kernels::wmma_f16;
 using maya::kernels::wmma_h16;
@@ -43,18 +47,14 @@ __host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
 #if defined(__CUDA_ARCH__)
     return __uint_as_float(u);
 #else
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
+    union { uint32_t u; float f; } c; c.u = u; return c.f;
 #endif
 }
 __host__ __device__ __forceinline__ uint32_t float_to_bits(float f) {
 #if defined(__CUDA_ARCH__)
     return __float_as_uint(f);
 #else
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    return u;
+    union { float f; uint32_t u; } x; x.f = f; return x.u;
 #endif
 }
 __host__ __device__ inline float half_bits_to_float(uint16_t h) {
@@ -77,7 +77,7 @@ __host__ __device__ inline float half_bits_to_float(uint16_t h) {
     return bits_to_float(u);
 }
 __host__ __device__ __forceinline__ uint8_t f32_to_e4m3fn(float v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return (uint8_t) __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
 #else
     const uint32_t u = float_to_bits(v);
@@ -98,14 +98,14 @@ __host__ __device__ __forceinline__ uint8_t f32_to_e4m3fn(float v) {
 #endif
 }
 __device__ __forceinline__ uint16_t f32x2_to_e4m3fnx2(float a, float b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return (uint16_t) __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
 #else
     return (uint16_t) f32_to_e4m3fn(a) | ((uint16_t) f32_to_e4m3fn(b) << 8);
 #endif
 }
 __host__ __device__ __forceinline__ uint16_t e4m3fn_to_f16(uint8_t q) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half_as_ushort(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) q, __NV_E4M3)));
 #else
     const uint16_t sign = (uint16_t) (q & 0x80u) << 8;
@@ -123,7 +123,7 @@ __host__ __device__ __forceinline__ uint16_t e4m3fn_to_f16(uint8_t q) {
 #endif
 }
 __device__ __forceinline__ uint32_t e4m3fnx2_to_h2_u32(uint16_t p2) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const __half2 h2 = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) p2, __NV_E4M3));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
 #else
@@ -139,7 +139,7 @@ __host__ __device__ __forceinline__ float e4m3fn_to_f32(uint8_t q) {
 #endif
 }
 __device__ __forceinline__ float2 e4m3fnx2_to_f2(uint16_t p2) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) p2, __NV_E4M3)));
 #else
     return u32_to_f2(e4m3fnx2_to_h2_u32(p2));
@@ -1027,7 +1027,7 @@ __device__ __forceinline__ void fa_load_tile_raw(uint8_t* Rs, const uint8_t* kc,
 // less an amount by its mantissa, looked up for the four at once (a byte permutation) - no branch, the same cost
 // whatever the values.  (0x7F, the NaN, comes out finite: f32_to_e4m3fn saturates, a cache has none.)
 __device__ __forceinline__ void e4m3x4_h4(uint32_t w, uint32_t& lo, uint32_t& hi) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     lo = e4m3fnx2_to_h2_u32((uint16_t) w), hi = e4m3fnx2_to_h2_u32((uint16_t) (w >> 16));
 #else
     const uint32_t t = w & 0x78787878u;
@@ -1118,7 +1118,13 @@ __device__ __forceinline__ void wg_wait0() {
 #endif
 }
 // (keeps the compiler from moving an accumulator's use across the asynchronous MMA's issue or wait)
-__device__ __forceinline__ void wg_fence_operand(float& r) { asm volatile("" : "+f"(r)::"memory"); }
+__device__ __forceinline__ void wg_fence_operand(float& r) {
+#ifndef STRATA_USE_HIP
+    asm volatile("" : "+f"(r)::"memory");
+#else
+    (void) r;   // (Hopper wgmma ordering: not a concern on RDNA3's synchronous WMMA)
+#endif
+}
 __device__ __forceinline__ void fence_proxy_async() {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -1126,9 +1132,14 @@ __device__ __forceinline__ void fence_proxy_async() {
 }
 // shared-memory matrix descriptor with the 128-byte swizzle: start, leading / stride byte offsets
 __device__ __forceinline__ uint64_t wg_desc(const void* p, uint32_t lbo, uint32_t sbo) {
+#ifndef STRATA_USE_HIP
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
     return (uint64_t) ((a & 0x3FFFF) >> 4) | ((uint64_t) ((lbo & 0x3FFFF) >> 4) << 16) |
            ((uint64_t) ((sbo & 0x3FFFF) >> 4) << 32) | ((uint64_t) 1 << 62);
+#else
+    // (Hopper wgmma descriptors: the wgmma dispatch gates on compute-major 9, never true on gfx1101)
+    (void) p; (void) lbo; (void) sbo; return 0;
+#endif
 }
 // A 64 x 128 tile (rows: keys, columns: dims), 1024-byte aligned, in the 128-byte-swizzle layout: two atoms of
 // 64 rows x 64 columns (128 bytes a row), the 16-byte chunks of row r XOR-permuted by r % 8. K is then B K-major
