@@ -915,7 +915,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA AND WIN32 AND NOT STRATA_IK2_WINDOWS)
     message(STATUS "Maya: maya-ik2 not built on Windows (STRATA_IK2_WINDOWS=ON builds it, untested)")
   endif()
-  if(STRATA_ENABLE_CUDA AND (NOT WIN32 OR STRATA_IK2_WINDOWS) AND (_ik2_archs OR NOT _ik2_filter))
+  # HIP port (community, RX 7800 XT): ik2 compiles through strata's hip_compat shims; the Ampere/Hopper
+  # PTX helpers inside ik2_kernels.cu carry STRATA_USE_HIP trap fallbacks, and the scalar kernel paths
+  # (IK2_ATTN_MMA=0, IK2_EXPERT_MMA=0, IK2_FLASH=0 at run time) are what a HIP build runs until the
+  # RDNA3 WMMA rewrites land. gfx1100-wave32 is the framework's default HIP target (gfx1101 validated).
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND
+     (NOT WIN32 OR STRATA_IK2_WINDOWS OR STRATA_ENABLE_HIP) AND
+     (STRATA_ENABLE_HIP OR _ik2_archs OR NOT _ik2_filter))
     add_library(ik2_kernels STATIC src/ik2/ik2_kernels.cu)
     # (third_party/ggml: ggml's IQ3_XXS grid and IQ4_XS values, src/ik2/ik2_iq_tables.h)
     target_include_directories(ik2_kernels PUBLIC ${_strata_gpu_include_directories} src/ik2 third_party/ggml)
@@ -932,7 +938,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(ik2_kernels_test PROPERTIES TIMEOUT 300)
       list(APPEND _ik2_targets ik2_kernels_test)
     endif()
-    if(_ik2_filter)
+    if(_ik2_filter AND STRATA_ENABLE_CUDA)
       set_property(TARGET ${_ik2_targets} PROPERTY CUDA_ARCHITECTURES ${_ik2_archs})
     endif()
   endif()
