@@ -15,13 +15,20 @@ jobs:
           ref: ik2-hip
           submodules: recursive
 
-      - name: Python + toolchain wheels
+      - name: Python + TheRock ROCm wheels
         shell: pwsh
         run: |
+          $v = "10.3.0a20261121"
           python -m pip install --upgrade pip
-          pip install ninja cmake rocm-sdk
-          $v = pip show rocm-sdk | Select-String 'Location'
-          Write-Host "rocm-sdk at: $v"
+          pip install --index-url https://nightly.repo.amd.com/rocm/core/whl-next/ --pre `
+            ninja cmake `
+            rocm==$v rocm-bootstrap rocm-sdk-core==$v rocm-sdk-devel==$v `
+            rocm-sdk-libraries==$v rocm-sdk-device-gfx1101==$v
+          if (-not (Test-Path "$((Split-Path (python -c 'import sys; print(sys.executable)')))\Scripts\rocm-sdk.exe")) {
+            Write-Host "rocm-sdk.exe missing after install; attempting init"
+          }
+          rocm-sdk init
+          Get-ChildItem "$((Split-Path (python -c 'import sys; print(sys.executable)')))\Scripts" -Filter rocm* | Select-Object Name
 
       - name: Build via their Windows HIP script
         shell: cmd
