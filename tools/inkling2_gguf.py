@@ -85,7 +85,9 @@ class Src:
 # ---- the names -------------------------------------------------------------------------------------------------
 TOP = {"embed.weight": "token_embd.weight", "embed_norm.weight": "token_embd_norm.weight",
        "unembed.weight": "output.weight", "norm.weight": "output_norm.weight",
-       "attn_res.output_query": "output_res_score.weight"}
+       "attn_res.output_query": "output_res_score.weight",
+       "middle_cycle_cross_pass_kv_queries": "loop_kv_res_query.weight",
+       "middle_cycle_cross_pass_queries": "loop_res_query.weight"}
 NORMS = {"attn_norm": "attn_norm", "q_input_norm": "attn_q_in_norm", "k_input_norm": "attn_k_in_norm",
          "v_input_norm": "attn_v_in_norm", "mlp_norm": "ffn_norm"}
 ATTN = {"wq_du.weight": "attn_q", "wk_dv.weight": "attn_k", "wv_dv.weight": "attn_v", "wr_du.weight": "attn_r",
@@ -121,13 +123,17 @@ def plan_of(k):
         return f"blk.{L}.ffn_gate_inp.weight", "plain"
     if root == "mlp" and leaf == "gate.bias":
         return f"blk.{L}.exp_probs_b.bias", "f32"
+    if root == "controllers":
+        mod, _, what = leaf.partition(".")
+        assert mod in ("attn", "k", "v", "mlp") and what.endswith("_weight"), k
+        return f"blk.{L}.loop_{mod}_{what[:-7]}.weight", "plain"
     raise ValueError(f"unexpected tensor {k}")
 
 
 # F32 whatever the checkpoint's dtype (llama.cpp's: 1-d tensors, norms, the router; the PR's forced ones)
 def forced_f32(name):
     return (name.endswith(("_norm.weight", "attn_rel_proj.weight", "_clip.weight", "_res_score.weight", ".bias",
-                           "ffn_gate_inp.weight")) or ".shortconv_" in name)
+                           "ffn_gate_inp.weight")) or ".shortconv_" in name or ".loop_" in name)
 
 
 # ---- the folds -------------------------------------------------------------------------------------------------
@@ -229,16 +235,28 @@ def check_config(tc):
     assert tc.get("use_value_norm_no_gamma", False) and tc.get("attn_res_normalize_values", False)
 
 
+def loop_info(tc):
+    lc = tc.get("loop_config") or {}
+    passes = int(lc.get("num_passes", 1) or 1)
+    return passes, int(lc.get("core_start", 0) or 0), int(lc.get("core_end", 0) or 0), int(lc.get("gate_rank", 0) or 0)
+
+
 def sliding_layers(tc):
     n = tc["num_hidden_layers"]
     local = tc.get("local_layer_ids")
     if local is None:
         local = [i for i in range(n) if i % 6 != 5]
-    return [i in set(local) for i in range(n)]
+    base = [i in set(local) for i in range(n)]
+    passes, c0, c1, _ = loop_info(tc)
+    if passes <= 1:
+        return base
+    return base[:c0] + base[c0:c1] * passes + base[c1:]
 
 
 def meta(w, tc):
-    w.add_block_count(tc["num_hidden_layers"])
+    passes, c0, c1, rank = loop_info(tc)
+    n_visit = tc["num_hidden_layers"] + (passes - 1) * (c1 - c0)
+    w.add_block_count(n_visit)
     w.add_context_length(tc.get("model_max_length", tc.get("max_position_embeddings")))
     w.add_embedding_length(tc["hidden_size"])
     w.add_feed_forward_length(tc["intermediate_size"])
@@ -264,7 +282,15 @@ def meta(w, tc):
     w.add_uint32(f"{ARCH}.unpadded_vocab_size", tc.get("unpadded_vocab_size") or tc["vocab_size"])
     w.add_float32(f"{ARCH}.qk_clip_threshold", tc["qk_l2_clip_threshold"])
     w.add_float32(f"{ARCH}.rel_clip_threshold", tc["rel_l2_clip_threshold"])
-    w.add_attn_res_block_size(tc["n_layers_per_attn_res_block"])
+    if hasattr(w, "add_attn_res_block_size"):
+        w.add_attn_res_block_size(tc["n_layers_per_attn_res_block"])
+    else:  # the pip gguf-py predates the arch helpers
+        w.add_uint32(f"{ARCH}.attn_res.block_size", tc["n_layers_per_attn_res_block"])
+    if passes > 1:
+        w.add_uint32(f"{ARCH}.num_loops", passes)
+        w.add_uint32(f"{ARCH}.loop.core_start", c0)
+        w.add_uint32(f"{ARCH}.loop.core_end", c1)
+        w.add_uint32(f"{ARCH}.loop.gate_rank", rank)
     w.add_bool(f"{ARCH}.attn_res_normalize_values", bool(tc.get("attn_res_normalize_values", False)))
     w.add_float32(f"{ARCH}.mlp_gate_softcap", float(tc.get("mlp_gate_softcap", 0.0)))
     w.add_float32(f"{ARCH}.mlp_up_softcap", float(tc.get("mlp_up_softcap", 0.0)))

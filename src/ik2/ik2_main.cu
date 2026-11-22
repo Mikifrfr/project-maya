@@ -3845,7 +3845,11 @@ int main(int argc, char** argv) {
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
-        const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
+        size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
+        if (const char *rm = getenv("IK2_RESERVE_MB")) {
+            const int v = std::atoi(rm);
+            if (v >= 256 && v <= 8192) reserve = (size_t) v << 20;   // a desktop session can buy residency with a thinner margin
+        }
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
